@@ -1,0 +1,87 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #0a0a0f;
+  --surface: #12121e;
+  --panel: #1a1a2e;
+  --border: #2d2d4e;
+  --accent: #7c3aed;
+  --accent-light: #a855f7;
+  --text: #e2e8f0;
+  --muted: #64748b;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+  font-size: 13px;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--surface); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--accent); }
+
+/* Selectable text in content areas */
+.selectable { -webkit-user-select: text; user-select: text; }
+
+/* Drop overlay */
+.drop-active::after {
+  content: 'Drop files to ingest';
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.5rem;
+  font-weight: 600;
+  color: var(--accent-light);
+  background: rgba(10, 10, 15, 0.92);
+  border: 2px dashed var(--accent);
+  border-radius: 12px;
+  z-index: 999;
+  pointer-events: none;
+  letter-spacing: 0.05em;
+}
+
+/* Node type badge colors */
+.badge-file     { background: #1d3a6e; color: #93c5fd; border-color: #3b82f6; }
+.badge-concept  { background: #3b1e6e; color: #c4b5fd; border-color: #8b5cf6; }
+.badge-person   { background: #064e3b; color: #6ee7b7; border-color: #10b981; }
+.badge-task     { background: #451a03; color: #fcd34d; border-color: #f59e0b; }
+.badge-decision { background: #450a0a; color: #fca5a5; border-color: #ef4444; }
+.badge-session  { background: #1e1b4b; color: #a5b4fc; border-color: #6366f1; }
+.badge-code     { background: #0c4a6e; color: #67e8f9; border-color: #06b6d4; }
+.badge-agent_memory { background: #500724; color: #f9a8d4; border-color: #ec4899; }
+
+/* Glow effect for active nodes */
+.node-glow {
+  box-shadow: 0 0 12px rgba(124, 58, 237, 0.5), 0 0 24px rgba(124, 58, 237, 0.2);
+}
+
+/* Graph canvas fill */
+.graph-canvas canvas {
+  border-radius: 8px;
+}
+
+/* Transition utilities */
+.transition-panel {
+  transition: width 0.2s ease, opacity 0.2s ease;
+}
