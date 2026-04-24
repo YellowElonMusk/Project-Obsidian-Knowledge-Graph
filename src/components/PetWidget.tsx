@@ -45,7 +45,7 @@ export function PetWidget({ nodeCount, edgeCount, isBusy, lastIngest, onOpenFull
           border: '1.5px solid #7c3aed66',
           animation: isBusy ? 'spin-slow 4s linear infinite' : undefined,
         }}
-        title="Open Cortex"
+        title="Memory Orb"
       >
         <span
           className="text-2xl"
@@ -80,6 +80,11 @@ export function PetWidget({ nodeCount, edgeCount, isBusy, lastIngest, onOpenFull
             boxShadow: '0 8px 32px rgba(0,0,0,0.6)',
           }}
         >
+          {/* Header */}
+          <div className="text-xs font-semibold pb-2 mb-1" style={{ color: '#a855f7', borderBottom: '1px solid #2d2d4e' }}>
+            Memory Orb
+          </div>
+
           {/* Stats */}
           <div className="flex gap-3 pb-2" style={{ borderBottom: '1px solid #2d2d4e' }}>
             <div className="text-center">

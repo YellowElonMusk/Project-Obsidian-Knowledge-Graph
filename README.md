@@ -1,19 +1,41 @@
 # ⬡ Cortex
 
-> A persistent knowledge graph and memory layer for AI agents and human teams. Obsidian meets agent memory.
+Your AI agents forget everything after each session. **Cortex remembers.**
+
+Cortex is a local knowledge graph that stores what your agents did, what files they touched, and what decisions were made — then surfaces that context back to them on the next session via MCP (Model Context Protocol). No more re-explaining the codebase. No more "as I mentioned last time."
+
+> Like Obsidian for agent memory. Drop files, build a graph, connect your agent — all local, no cloud.
 
 **Local-first. No account. No server. No telemetry.**
 
 ---
 
-## What it does
+## Quick connect
 
-Cortex is a Tauri desktop app that ingests your files, builds a local knowledge graph, and exposes it as context to any AI agent via MCP (Model Context Protocol).
+Add to your Claude Code / Cursor MCP config:
+
+```json
+{
+  "mcpServers": {
+    "cortex": {
+      "command": "nc",
+      "args": ["127.0.0.1", "7340"]
+    }
+  }
+}
+```
+
+Then start Cortex, drop in your project files, and your agent can immediately call `graph_search`, `get_project_context`, `write_agent_memory`, and more.
+
+---
+
+## What it does
 
 - **Drop any file** → entities extracted → graph built automatically
 - **Visual graph canvas** — force-directed, color-coded by node type
 - **Agent memory** — every agent session writes back into the graph; next session can recall what was done
 - **Local MCP server** on `localhost:7340` — any Claude Code / Cursor / agent connects and queries the graph
+- **Semantic search** — nomic-embed-text-v1.5 (ONNX, ~70MB, downloaded on first launch) adds cosine similarity fallback when keyword search returns sparse results
 - **Vault mirror** — every ingested file gets a `.md` copy for human readability and git-compatibility
 
 ---
@@ -35,28 +57,26 @@ Cortex is a Tauri desktop app that ingests your files, builds a local knowledge 
 
 ### Prerequisites
 
-- **Windows** with [Visual Studio 2022 Build Tools](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022) (C++ workload)
-- **Rust** — install via [rustup.rs](https://rustup.rs) (MSVC toolchain)
+- **Rust** via [rustup.rs](https://rustup.rs)
 - **Node.js** 18+
+- Platform-specific: see [DEVELOPMENT.md](./DEVELOPMENT.md) for macOS (Xcode CLT), Linux (webkit2gtk + build-essential), and Windows (VS 2022 Build Tools) setup.
 
 ### Install & run
 
-```bat
+```sh
 git clone https://github.com/YellowElonMusk/Project-Obsidian-Knowledge-Graph.git
 cd Project-Obsidian-Knowledge-Graph
 
 npm install
-
-rem Launch dev mode (sets up MSVC env automatically)
-dev.bat
+npm run tauri:dev
 ```
 
-> **Important on Windows:** Always use `dev.bat` to launch — it calls `vcvars64.bat` before starting Tauri so the MSVC linker is on PATH.
+> **Windows:** Use `dev.bat` instead — it calls `vcvars64.bat` before launching Tauri to ensure the MSVC linker is on PATH.
 
 ### Production build
 
-```bat
-build.bat
+```sh
+npm run tauri:build
 ```
 
 ---
@@ -155,7 +175,7 @@ The vault folder is human-readable and git-friendly — same trust signal as Obs
 
 ## Roadmap
 
-- [ ] Local embedding model (nomic-embed via ONNX) for semantic search
+- [x] Local embedding model (nomic-embed-text-v1.5 via ONNX) for semantic search
 - [ ] PDF text extraction via lopdf
 - [ ] Timeline scrubber — replay graph state at any point in time
 - [ ] Multiple vault directories

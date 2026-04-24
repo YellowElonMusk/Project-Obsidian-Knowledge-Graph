@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::net::TcpListener;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use serde::{Deserialize, Serialize};
@@ -39,7 +41,12 @@ impl JsonRpcResponse {
     }
 }
 
-pub async fn start_mcp_server(db_path: String, port: u16) {
+pub async fn start_mcp_server(
+    db_path: String,
+    port: u16,
+    embedding_model: Arc<std::sync::Mutex<Option<crate::embeddings::EmbeddingModel>>>,
+    connections: Arc<AtomicUsize>,
+) {
     let listener = match TcpListener::bind(format!("127.0.0.1:{}", port)).await {
         Ok(l) => l,
         Err(e) => {
@@ -54,10 +61,14 @@ pub async fn start_mcp_server(db_path: String, port: u16) {
             Ok((socket, addr)) => {
                 println!("[Cortex MCP] Client connected: {}", addr);
                 let db = db_path.clone();
+                let model = Arc::clone(&embedding_model);
+                let conns = Arc::clone(&connections);
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client(socket, db).await {
+                    conns.fetch_add(1, Ordering::Relaxed);
+                    if let Err(e) = handle_client(socket, db, model).await {
                         eprintln!("[Cortex MCP] Client error: {}", e);
                     }
+                    conns.fetch_sub(1, Ordering::Relaxed);
                 });
             }
             Err(e) => eprintln!("[Cortex MCP] Accept error: {}", e),
@@ -65,7 +76,11 @@ pub async fn start_mcp_server(db_path: String, port: u16) {
     }
 }
 
-async fn handle_client(socket: tokio::net::TcpStream, db_path: String) -> anyhow::Result<()> {
+async fn handle_client(
+    socket: tokio::net::TcpStream,
+    db_path: String,
+    embedding_model: Arc<std::sync::Mutex<Option<crate::embeddings::EmbeddingModel>>>,
+) -> anyhow::Result<()> {
     let (reader, mut writer) = socket.into_split();
     let mut buf_reader = BufReader::new(reader);
     let mut line = String::new();
@@ -79,7 +94,7 @@ async fn handle_client(socket: tokio::net::TcpStream, db_path: String) -> anyhow
         }
 
         let response = match serde_json::from_str::<JsonRpcRequest>(&trimmed) {
-            Ok(req) => handle_rpc(req, &db_path).await,
+            Ok(req) => handle_rpc(req, &db_path, &embedding_model).await,
             Err(e) => JsonRpcResponse::error_resp(None, -32700, &format!("Parse error: {}", e)),
         };
 
@@ -90,7 +105,11 @@ async fn handle_client(socket: tokio::net::TcpStream, db_path: String) -> anyhow
     Ok(())
 }
 
-async fn handle_rpc(req: JsonRpcRequest, db_path: &str) -> JsonRpcResponse {
+async fn handle_rpc(
+    req: JsonRpcRequest,
+    db_path: &str,
+    embedding_model: &Arc<std::sync::Mutex<Option<crate::embeddings::EmbeddingModel>>>,
+) -> JsonRpcResponse {
     let id = req.id.clone();
     match req.method.as_str() {
         "initialize" => JsonRpcResponse::success(id, json!({
@@ -103,7 +122,7 @@ async fn handle_rpc(req: JsonRpcRequest, db_path: &str) -> JsonRpcResponse {
             "tools": [
                 {
                     "name": "graph_search",
-                    "description": "Full-text search over Cortex knowledge graph nodes. Returns matching nodes with content.",
+                    "description": "Search the Cortex knowledge graph. Uses full-text search (FTS5) with automatic semantic similarity fallback when fewer than 3 exact matches are found.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -168,7 +187,7 @@ async fn handle_rpc(req: JsonRpcRequest, db_path: &str) -> JsonRpcResponse {
             let params = req.params.unwrap_or(json!({}));
             let name = params["name"].as_str().unwrap_or("").to_string();
             let args = params["arguments"].clone();
-            match call_tool(&name, args, db_path) {
+            match call_tool(&name, args, db_path, embedding_model) {
                 Ok(text) => JsonRpcResponse::success(id, json!({
                     "content": [{ "type": "text", "text": text }]
                 })),
@@ -183,7 +202,12 @@ async fn handle_rpc(req: JsonRpcRequest, db_path: &str) -> JsonRpcResponse {
     }
 }
 
-fn call_tool(name: &str, args: Value, db_path: &str) -> anyhow::Result<String> {
+fn call_tool(
+    name: &str,
+    args: Value,
+    db_path: &str,
+    embedding_model: &Arc<std::sync::Mutex<Option<crate::embeddings::EmbeddingModel>>>,
+) -> anyhow::Result<String> {
     let conn = Connection::open(db_path)
         .map_err(|e| anyhow::anyhow!("DB open failed: {}", e))?;
 
@@ -193,22 +217,48 @@ fn call_tool(name: &str, args: Value, db_path: &str) -> anyhow::Result<String> {
             if query.is_empty() {
                 return Ok("Please provide a search query.".into());
             }
-            let nodes = crate::graph::search_nodes(&conn, query)?;
+
+            let fts_nodes = crate::graph::search_nodes(&conn, query)?;
+
+            // If FTS5 returned 3+ results, return them directly
+            if fts_nodes.len() >= 3 {
+                return Ok(format_node_results(&fts_nodes));
+            }
+
+            // Semantic fallback when FTS5 returns sparse results
+            let nodes = if let Ok(mut model_lock) = embedding_model.lock() {
+                if let Some(model) = model_lock.as_mut() {
+                    match model.embed(query) {
+                        Ok(query_vec) => {
+                            match crate::graph::search_nodes_semantic(&conn, &query_vec, 20) {
+                                Ok(semantic_results) => {
+                                    // Merge: FTS5 results first, then semantic-only hits
+                                    let fts_ids: std::collections::HashSet<&str> =
+                                        fts_nodes.iter().map(|n| n.id.as_str()).collect();
+                                    let mut merged = fts_nodes.clone();
+                                    for (node, _score) in semantic_results {
+                                        if !fts_ids.contains(node.id.as_str()) {
+                                            merged.push(node);
+                                        }
+                                    }
+                                    merged
+                                }
+                                Err(_) => fts_nodes,
+                            }
+                        }
+                        Err(_) => fts_nodes,
+                    }
+                } else {
+                    fts_nodes
+                }
+            } else {
+                fts_nodes
+            };
+
             if nodes.is_empty() {
                 return Ok(format!("No results found for '{}'.", query));
             }
-            let result = nodes.iter().enumerate().map(|(i, n)| {
-                let preview = n.content.as_deref()
-                    .unwrap_or("")
-                    .chars()
-                    .take(300)
-                    .collect::<String>();
-                format!(
-                    "{}. **{}** [{}]\n   ID: {}\n   {}",
-                    i + 1, n.label, n.node_type, n.id, preview
-                )
-            }).collect::<Vec<_>>().join("\n\n");
-            Ok(format!("Found {} results:\n\n{}", nodes.len(), result))
+            Ok(format_node_results(&nodes))
         }
 
         "get_project_context" => {
@@ -288,4 +338,19 @@ fn call_tool(name: &str, args: Value, db_path: &str) -> anyhow::Result<String> {
 
         _ => Err(anyhow::anyhow!("Unknown tool: {}", name)),
     }
+}
+
+fn format_node_results(nodes: &[crate::graph::Node]) -> String {
+    let result = nodes.iter().enumerate().map(|(i, n)| {
+        let preview = n.content.as_deref()
+            .unwrap_or("")
+            .chars()
+            .take(300)
+            .collect::<String>();
+        format!(
+            "{}. **{}** [{}]\n   ID: {}\n   {}",
+            i + 1, n.label, n.node_type, n.id, preview
+        )
+    }).collect::<Vec<_>>().join("\n\n");
+    format!("Found {} results:\n\n{}", nodes.len(), result)
 }

@@ -1,4 +1,5 @@
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::path::PathBuf;
 use std::fs;
 use rusqlite::Connection;
@@ -8,6 +9,7 @@ use serde::{Deserialize, Serialize};
 mod graph;
 mod ingest;
 mod mcp_server;
+mod embeddings;
 
 // ── App state ─────────────────────────────────────────────────────────────────
 
@@ -15,6 +17,9 @@ pub struct AppState {
     pub db: Mutex<Connection>,
     pub vault_path: PathBuf,
     pub mcp_port: u16,
+    pub embedding_model: Arc<Mutex<Option<embeddings::EmbeddingModel>>>,
+    pub model_download_progress: Arc<Mutex<Option<(u64, u64)>>>,
+    pub mcp_connections: Arc<AtomicUsize>,
 }
 
 // ── Serializable return types ──────────────────────────────────────────────────
@@ -26,11 +31,46 @@ pub struct IngestSummary {
     pub title: String,
 }
 
+#[derive(Serialize)]
+pub struct ModelStatus {
+    pub ready: bool,
+    pub downloading: bool,
+    pub progress_pct: u8,
+}
+
 // ── Tauri commands ─────────────────────────────────────────────────────────────
 
 #[tauri::command]
 fn get_mcp_port(state: State<AppState>) -> u16 {
     state.mcp_port
+}
+
+#[tauri::command]
+fn get_mcp_connections(state: State<AppState>) -> usize {
+    state.mcp_connections.load(Ordering::Relaxed)
+}
+
+#[tauri::command]
+fn get_model_status(state: State<AppState>) -> ModelStatus {
+    let ready = state.embedding_model.lock()
+        .ok()
+        .map(|lock| lock.is_some())
+        .unwrap_or(false);
+
+    let (downloading, progress_pct) = state.model_download_progress.lock()
+        .ok()
+        .and_then(|prog| *prog)
+        .map(|(dl, total)| {
+            let pct = if total > 0 {
+                ((dl as f64 / total as f64) * 100.0).min(100.0) as u8
+            } else {
+                0u8
+            };
+            (true, pct)
+        })
+        .unwrap_or((false, 0u8));
+
+    ModelStatus { ready, downloading, progress_pct }
 }
 
 #[tauri::command]
@@ -54,7 +94,20 @@ fn ingest_file(
         graph::insert_edge(&db, edge).map_err(|e| e.to_string())?;
     }
 
-    // Write vault markdown mirror
+    // Compute embeddings for each node if model is ready
+    if let Ok(mut model_lock) = state.embedding_model.lock() {
+        if let Some(model) = model_lock.as_mut() {
+            for node in &result.nodes {
+                let text = format!("{} {}",
+                    node.label,
+                    node.content.as_deref().unwrap_or(""));
+                if let Ok(embedding) = model.embed(&text) {
+                    let _ = graph::update_node_embedding(&db, &node.id, &embedding);
+                }
+            }
+        }
+    }
+
     let vault_file = state.vault_path.join(format!("{}.md", sanitize_filename(&title)));
     let _ = fs::write(&vault_file, &result.vault_markdown);
 
@@ -81,6 +134,20 @@ fn ingest_text(
     }
     for edge in &result.edges {
         graph::insert_edge(&db, edge).map_err(|e| e.to_string())?;
+    }
+
+    // Compute embeddings for each node if model is ready
+    if let Ok(mut model_lock) = state.embedding_model.lock() {
+        if let Some(model) = model_lock.as_mut() {
+            for node in &result.nodes {
+                let text = format!("{} {}",
+                    node.label,
+                    node.content.as_deref().unwrap_or(""));
+                if let Ok(embedding) = model.embed(&text) {
+                    let _ = graph::update_node_embedding(&db, &node.id, &embedding);
+                }
+            }
+        }
     }
 
     let vault_file = state.vault_path.join(format!("{}.md", sanitize_filename(&title)));
@@ -123,7 +190,6 @@ fn get_project_context(
 ) -> Result<graph::GraphData, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let nodes = graph::get_project_nodes(&db, &project_name).map_err(|e| e.to_string())?;
-    // Get edges between these nodes
     let node_ids: std::collections::HashSet<String> = nodes.iter().map(|n| n.id.clone()).collect();
     let all_edges = graph::get_graph_data(&db).map_err(|e| e.to_string())?.edges;
     let edges = all_edges.into_iter()
@@ -235,16 +301,65 @@ pub fn run() {
 
             let mcp_port: u16 = 7340;
 
+            // Shared state for embedding model and MCP connections
+            let embedding_model: Arc<Mutex<Option<embeddings::EmbeddingModel>>> =
+                Arc::new(Mutex::new(None));
+            let model_download_progress: Arc<Mutex<Option<(u64, u64)>>> =
+                Arc::new(Mutex::new(None));
+            let mcp_connections: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+
             // Spawn MCP server
             let db_path_str = db_path.to_string_lossy().to_string();
+            let model_for_mcp = Arc::clone(&embedding_model);
+            let conns_for_mcp = Arc::clone(&mcp_connections);
             tauri::async_runtime::spawn(async move {
-                mcp_server::start_mcp_server(db_path_str, mcp_port).await;
+                mcp_server::start_mcp_server(db_path_str, mcp_port, model_for_mcp, conns_for_mcp).await;
+            });
+
+            // Spawn background task: download model if needed, then load it
+            let model_for_task = Arc::clone(&embedding_model);
+            let progress_for_task = Arc::clone(&model_download_progress);
+            let data_dir_for_task = data_dir.clone();
+            tauri::async_runtime::spawn(async move {
+                if !embeddings::models_exist(&data_dir_for_task) {
+                    let prog = Arc::clone(&progress_for_task);
+                    if let Err(e) = embeddings::download_model_files(
+                        &data_dir_for_task,
+                        move |dl, total| {
+                            if let Ok(mut p) = prog.lock() {
+                                *p = Some((dl, total));
+                            }
+                        },
+                    ).await {
+                        eprintln!("[Cortex] Model download failed: {}", e);
+                        return;
+                    }
+                }
+
+                // Clear download progress
+                if let Ok(mut p) = progress_for_task.lock() {
+                    *p = None;
+                }
+
+                let (model_path, tokenizer_path) = embeddings::model_paths(&data_dir_for_task);
+                match embeddings::EmbeddingModel::load(&model_path, &tokenizer_path) {
+                    Ok(m) => {
+                        if let Ok(mut lock) = model_for_task.lock() {
+                            *lock = Some(m);
+                        }
+                        println!("[Cortex] Embedding model ready");
+                    }
+                    Err(e) => eprintln!("[Cortex] Embedding model load failed: {}", e),
+                }
             });
 
             app.manage(AppState {
                 db: Mutex::new(conn),
                 vault_path,
                 mcp_port,
+                embedding_model,
+                model_download_progress,
+                mcp_connections,
             });
 
             // Set up system tray
@@ -254,6 +369,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_mcp_port,
+            get_mcp_connections,
+            get_model_status,
             ingest_file,
             ingest_text,
             get_graph_data,

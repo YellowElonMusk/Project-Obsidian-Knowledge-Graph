@@ -34,3 +34,6 @@ vault/
 
 # Cargo lock (can be committed for apps, optional here)
 # Cargo.lock
+
+# Machine-specific MSVC linker config (Windows only — see DEVELOPMENT.md)
+.cargo/config.toml

@@ -77,6 +77,18 @@ pub fn init_db(conn: &Connection) -> anyhow::Result<()> {
             tokenize='porter ascii'
         );
     ")?;
+
+    // Idempotent migration: add embedding column if it doesn't exist yet
+    let col_exists: bool = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('nodes') WHERE name='embedding'",
+        [],
+        |row| row.get::<_, i64>(0),
+    ).unwrap_or(0) > 0;
+
+    if !col_exists {
+        conn.execute_batch("ALTER TABLE nodes ADD COLUMN embedding BLOB")?;
+    }
+
     Ok(())
 }
 
@@ -395,4 +407,57 @@ pub fn get_recent_sessions(conn: &Connection, limit: usize) -> anyhow::Result<Ve
         })
     })?.collect::<Result<Vec<_>>>()?;
     Ok(nodes)
+}
+
+// ── Embedding support ──────────────────────────────────────────────────────────
+
+pub fn update_node_embedding(conn: &Connection, node_id: &str, embedding: &[f32]) -> anyhow::Result<()> {
+    let blob = crate::embeddings::vec_to_blob(embedding);
+    conn.execute(
+        "UPDATE nodes SET embedding = ?1 WHERE id = ?2",
+        params![blob, node_id],
+    )?;
+    Ok(())
+}
+
+pub fn get_all_embeddings(conn: &Connection) -> anyhow::Result<Vec<(String, Vec<f32>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, embedding FROM nodes WHERE embedding IS NOT NULL"
+    )?;
+    let results = stmt.query_map([], |row| {
+        let id: String = row.get(0)?;
+        let blob: Vec<u8> = row.get(1)?;
+        Ok((id, blob))
+    })?.collect::<Result<Vec<_>>>()?;
+
+    Ok(results.into_iter()
+        .map(|(id, blob)| (id, crate::embeddings::blob_to_vec(&blob)))
+        .collect())
+}
+
+/// Load all node embeddings, rank by cosine similarity to `query_vec`, return top-N with scores.
+pub fn search_nodes_semantic(
+    conn: &Connection,
+    query_vec: &[f32],
+    limit: usize,
+) -> anyhow::Result<Vec<(Node, f32)>> {
+    let all_embeddings = get_all_embeddings(conn)?;
+
+    let mut scored: Vec<(String, f32)> = all_embeddings.into_iter()
+        .map(|(id, vec)| {
+            let score = crate::embeddings::cosine_similarity(query_vec, &vec);
+            (id, score)
+        })
+        .collect();
+
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(limit);
+
+    let mut results = Vec::new();
+    for (node_id, score) in scored {
+        if let Some(node) = get_node(conn, &node_id)? {
+            results.push((node, score));
+        }
+    }
+    Ok(results)
 }

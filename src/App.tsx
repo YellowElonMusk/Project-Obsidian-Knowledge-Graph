@@ -8,23 +8,32 @@ import { NodeDetailPanel } from './components/NodeDetail';
 import { SessionHistory } from './components/SessionHistory';
 import { PetWidget } from './components/PetWidget';
 import { useGraph } from './hooks/useGraph';
-import { GraphNode } from './types';
+import { GraphNode, timeAgo } from './types';
 import './index.css';
 
 type SidePanel = 'node' | 'sessions' | 'search' | null;
 type View = 'graph' | 'pet';
 
+interface ModelStatus {
+  ready: boolean;
+  downloading: boolean;
+  progress_pct: number;
+}
+
 export default function App() {
   const graph = useGraph();
   const [view, setView] = useState<View>('graph');
-  const [sidePanel, setSidePanel] = useState<SidePanel>(null);
+  const [sidePanel, setSidePanel] = useState<SidePanel>('sessions');
   const [searchQuery, setSearchQuery] = useState('');
   const [currentProject, setCurrentProject] = useState('default');
   const [projects, setProjects] = useState<string[]>([]);
   const [isDragOver, setIsDragOver] = useState(false);
   const [mcpPort, setMcpPort] = useState<number | null>(null);
+  const [mcpConnected, setMcpConnected] = useState(false);
   const [vaultPath, setVaultPath] = useState('');
   const [dims, setDims] = useState({ w: window.innerWidth, h: window.innerHeight });
+  const [lastSession, setLastSession] = useState<GraphNode | null>(null);
+  const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -40,6 +49,34 @@ export default function App() {
       invoke<string[]>('list_projects').then(setProjects).catch(() => {});
     }
   }, [graph.lastIngest]);
+
+  // Refresh last session on project change or after ingest
+  useEffect(() => {
+    invoke<GraphNode | null>('get_last_session', { projectName: currentProject })
+      .then(setLastSession)
+      .catch(() => setLastSession(null));
+  }, [currentProject, graph.lastIngest]);
+
+  // Poll MCP connection count every 3s
+  useEffect(() => {
+    const poll = setInterval(() => {
+      invoke<number>('get_mcp_connections')
+        .then(n => setMcpConnected(n > 0))
+        .catch(() => setMcpConnected(false));
+    }, 3000);
+    return () => clearInterval(poll);
+  }, []);
+
+  // Poll model download status every 2s until ready
+  useEffect(() => {
+    if (modelStatus?.ready) return;
+    const poll = setInterval(() => {
+      invoke<ModelStatus>('get_model_status')
+        .then(setModelStatus)
+        .catch(() => {});
+    }, 2000);
+    return () => clearInterval(poll);
+  }, [modelStatus?.ready]);
 
   useEffect(() => {
     const update = () => setDims({ w: window.innerWidth, h: window.innerHeight });
@@ -132,8 +169,9 @@ export default function App() {
   }, [sidePanel]);
 
   const panelWidth = sidePanel ? 300 : 0;
+  const bannerHeight = lastSession ? 32 : 0;
   const canvasW = dims.w - panelWidth;
-  const canvasH = dims.h - 48 - 24; // toolbar + statusbar
+  const canvasH = dims.h - 48 - 24 - bannerHeight; // toolbar + statusbar + banner
 
   if (view === 'pet') {
     return (
@@ -204,13 +242,35 @@ export default function App() {
 
         <div className="flex-1" />
 
+        {/* MCP connection status badge + model download progress */}
         {mcpPort && (
-          <div
-            className="flex items-center gap-1.5 px-2 py-1 rounded text-xs"
-            style={{ background: '#064e3b22', border: '1px solid #064e3b44', color: '#6ee7b7' }}
-          >
-            <span className="w-1.5 h-1.5 rounded-full bg-green-400" />
-            MCP :{mcpPort}
+          <div className="flex flex-col gap-0.5">
+            <div
+              className="flex items-center gap-1.5 px-2 py-1 rounded text-xs"
+              style={{
+                background: mcpConnected ? '#064e3b22' : '#1a1a2e',
+                border: `1px solid ${mcpConnected ? '#064e3b44' : '#2d2d4e'}`,
+                color: mcpConnected ? '#6ee7b7' : '#64748b',
+              }}
+            >
+              <span
+                className="w-1.5 h-1.5 rounded-full"
+                style={{ background: mcpConnected ? '#34d399' : '#475569' }}
+              />
+              {mcpConnected ? 'Agent connected' : 'Waiting for agent'}
+            </div>
+            {modelStatus && !modelStatus.ready && modelStatus.downloading && (
+              <div
+                className="relative h-0.5 rounded-full overflow-hidden mx-2"
+                style={{ background: '#2d2d4e' }}
+                title={`Downloading model: ${modelStatus.progress_pct}%`}
+              >
+                <div
+                  className="absolute inset-y-0 left-0 rounded-full transition-all"
+                  style={{ width: `${modelStatus.progress_pct}%`, background: '#a855f7' }}
+                />
+              </div>
+            )}
           </div>
         )}
 
@@ -236,44 +296,83 @@ export default function App() {
           onClick={() => setView('pet')}
           className="text-xs px-2 py-1 rounded hover:bg-white/5 transition-colors"
           style={{ color: '#64748b', border: '1px solid #2d2d4e' }}
-          title="Compact mode"
-        >◴</button>
+          title="Memory Orb"
+        >◴ Memory Orb</button>
       </header>
 
       {/* Main content */}
       <div className="flex flex-1 overflow-hidden">
-        {/* Graph */}
-        <div className="flex-1 relative overflow-hidden">
-          <GraphCanvas
-            nodes={graph.nodes}
-            edges={graph.edges}
-            selectedNodeId={graph.selectedNode?.id ?? null}
-            onNodeClick={handleNodeClick}
-            onBackgroundClick={handleBgClick}
-            width={canvasW}
-            height={canvasH}
-          />
+        {/* Graph area */}
+        <div className="flex-1 flex flex-col overflow-hidden">
+          {/* Last session banner */}
+          {lastSession && (
+            <div
+              className="shrink-0 flex items-center gap-2 px-3 cursor-pointer hover:bg-white/5 transition-colors"
+              style={{
+                height: 32,
+                background: '#0d0d1a',
+                borderBottom: '1px solid #2d2d4e',
+              }}
+              onClick={() => setSidePanel('sessions')}
+            >
+              <span className="text-green-400 text-xs">●</span>
+              <span className="text-xs" style={{ color: '#94a3b8' }}>
+                {lastSession.label}
+              </span>
+              <span className="text-xs text-muted">— {timeAgo(lastSession.created_at)}</span>
+              <span className="text-xs text-muted ml-auto">expand ▾</span>
+            </div>
+          )}
 
-          {graph.nodes.length === 0 && !isDragOver && (
-            <div className="absolute inset-0 flex flex-col items-center justify-center gap-6 pointer-events-none">
-              <div
-                className="w-32 h-32 rounded-full flex items-center justify-center"
-                style={{
-                  background: 'radial-gradient(circle, #4c1d9522, #0a0a0f)',
-                  border: '2px dashed #2d2d4e',
-                  animation: 'pulse 3s ease-in-out infinite',
-                }}
-              >
-                <span className="text-5xl" style={{ opacity: 0.3 }}>⬡</span>
-              </div>
-              <div className="text-center">
-                <p className="font-semibold" style={{ color: 'rgba(226,232,240,0.4)' }}>
-                  Drop files to start building your graph
-                </p>
-                <p className="text-xs mt-2 text-muted">
-                  .md .txt .pdf .json and any code file
-                </p>
-                <p className="text-xs mt-1 text-muted">
+          {/* Canvas */}
+          <div className="flex-1 relative overflow-hidden">
+            <GraphCanvas
+              nodes={graph.nodes}
+              edges={graph.edges}
+              selectedNodeId={graph.selectedNode?.id ?? null}
+              onNodeClick={handleNodeClick}
+              onBackgroundClick={handleBgClick}
+              width={canvasW}
+              height={canvasH}
+            />
+
+            {graph.nodes.length === 0 && !isDragOver && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-6">
+                <div className="text-center">
+                  <p
+                    className="text-4xl font-bold mb-3"
+                    style={{ color: 'rgba(226,232,240,0.9)' }}
+                  >
+                    Your agents forget everything.
+                  </p>
+                  <p className="text-2xl font-semibold" style={{ color: '#a855f7' }}>
+                    Cortex remembers.
+                  </p>
+                </div>
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={handleOpenFile}
+                    className="text-sm px-4 py-2 rounded transition-colors hover:bg-white/10"
+                    style={{ border: '1px solid #2d2d4e', color: '#94a3b8' }}
+                  >
+                    Drop files to start
+                  </button>
+                  <button
+                    onClick={() => {
+                      if (mcpPort) {
+                        navigator.clipboard.writeText(
+                          `{\n  "mcpServers": {\n    "cortex": {\n      "command": "nc",\n      "args": ["127.0.0.1", "${mcpPort}"]\n    }\n  }\n}`
+                        ).catch(() => {});
+                      }
+                    }}
+                    className="text-sm px-4 py-2 rounded transition-colors"
+                    style={{ background: '#7c3aed', color: 'white' }}
+                    title="Copies MCP config to clipboard"
+                  >
+                    Connect your agent →
+                  </button>
+                </div>
+                <p className="text-xs text-muted">
                   or press{' '}
                   <kbd className="px-1 py-0.5 rounded text-xs" style={{ background: '#2d2d4e', color: '#94a3b8' }}>
                     Ctrl+O
@@ -281,8 +380,8 @@ export default function App() {
                   {' '}to open files
                 </p>
               </div>
-            </div>
-          )}
+            )}
+          </div>
         </div>
 
         {/* Side panel */}
@@ -360,6 +459,13 @@ export default function App() {
             vault: <code style={{ color: 'rgba(96,165,250,0.6)' }}>
               {vaultPath.split(/[/\\]/).slice(-2).join('/')}
             </code>
+          </span>
+        )}
+        {modelStatus && !modelStatus.ready && (
+          <span style={{ color: '#a855f7' }}>
+            {modelStatus.downloading
+              ? `Downloading semantic model… ${modelStatus.progress_pct}%`
+              : 'Loading semantic model…'}
           </span>
         )}
         <span className="ml-auto">
